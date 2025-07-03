@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Simple ProxBoard Client</title>
+</head>
+<body>
+  <h1>Simple ProxBoard WebSocket Client</h1>
+
+  <!-- WebSocket Connection -->
+  <div>
+    <label for="wsUrl">WebSocket Server URL:</label>
+    <input type="text" id="wsUrl" value="ws://localhost:8080" size="40">
+    <button onclick="connectWebSocket()">Connect</button>
+    <button onclick="disconnectWebSocket()">Disconnect</button>
+  </div>
+
+  <hr />
+
+  <!-- ProxyHost Info -->
+  <div>
+    <label for="proxyHostAddress">Proxy Host Address:</label>
+    <input type="text" id="proxyHostAddress" placeholder="e.g., 127.0.0.1">
+    <label for="proxyHostPort">Proxy Host Port:</label>
+    <input type="number" id="proxyHostPort" placeholder="e.g., 55555" min="1" max="65535">
+    <button onclick="createProxy()">Create Proxy for This Host</button>
+  </div>
+
+  <!-- Actions -->
+  <div>
+    <button onclick="listProxies()">List Active Proxies</button>
+  </div>
+
+  <!-- Output -->
+  <h2>Server Responses:</h2>
+  <textarea id="output" readonly rows="15" cols="80"></textarea>
+
+  <script>
+    let ws;
+    const outputElement = document.getElementById('output');
+    const wsUrlInput = document.getElementById('wsUrl');
+
+    function log(message) {
+      outputElement.value += message + '\n';
+      outputElement.scrollTop = outputElement.scrollHeight;
+    }
+
+    function connectWebSocket() {
+      const wsUrl = wsUrlInput.value;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        log('Already connected.');
+        return;
+      }
+
+      log(`Connecting to ${wsUrl}...`);
+      ws = new WebSocket(wsUrl);
+
+      ws.onopen = () => {
+        log('WebSocket connected!');
+      };
+
+      ws.onmessage = (event) => {
+        log('Received: ' + event.data);
+      };
+
+      ws.onclose = () => {
+        log('WebSocket disconnected.');
+      };
+
+      ws.onerror = (error) => {
+        log('WebSocket error.');
+        console.error('WebSocket error:', error);
+      };
+    }
+
+    function disconnectWebSocket() {
+      if (ws) {
+        ws.close();
+      }
+    }
+
+    function sendMessage(message) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(message));
+        log('Sent: ' + JSON.stringify(message));
+      } else {
+        log('WebSocket not connected.');
+      }
+    }
+
+    function createProxy() {
+      const proxyHostAddress = document.getElementById('proxyHostAddress').value.trim();
+      const proxyHostPort = parseInt(document.getElementById('proxyHostPort').value, 10);
+
+      if (!proxyHostAddress || isNaN(proxyHostPort)) {
+        log('Please enter a valid proxy host address and port.');
+        return;
+      }
+
+      sendMessage({
+        action: 'create',
+        proxyHostAddress,
+        proxyHostPort
+      });
+    }
+
+    function listProxies() {
+      sendMessage({ action: 'list' });
+    }
+  </script>
+</body>
+</html>
