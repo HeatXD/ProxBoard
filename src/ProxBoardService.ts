@@ -120,6 +120,7 @@ export class ProxBoardService {
         });
 
         console.log(`API Commands:`);
+        console.log(`  { "action": "auth", "token": ... }`);
         console.log(`  { "action": "list" }`);
         console.log(`  { "action": "create", "proxyHostAddress": "...", "proxyHostPort": ... }`);
         console.log(`  { "action": "stop", "proxyPort": ... }`);
