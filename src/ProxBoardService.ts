@@ -1,3 +1,19 @@
+/**
+ * ProxBoard Proxy Message Layout:
+ *
+ * The proxy message format wraps a UDP payload with the destination info.
+ * This allows sending UDP packets through a proxy server that forwards them.
+ *
+ * Structure:
+ * │ Hostname Length (1 byte) │ Hostname (variable length) │ Target Port (2 bytes) │ Payload (remaining bytes) │
+ *
+ * Fields:
+ * - Hostname Length: 1 byte indicating the length of the hostname string (max 255)
+ * - Hostname: UTF-8 encoded string representing the target host (e.g., "8.8.8.8" or "example.com")
+ * - Target Port: 2 bytes unsigned integer (big-endian) for the UDP destination port (1-65535)
+ * - Payload: The actual UDP packet data to forward
+ */
+
 import * as dgram from 'dgram';
 import { WebSocketServer, WebSocket } from 'ws';
 
