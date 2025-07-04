@@ -17,7 +17,7 @@
 import type { Server, ServerWebSocket } from "bun";
 
 interface ActiveProxy {
-    proxySocket: any; // Bun's UDPSocket type
+    proxySocket: any;
     proxyHost: { address: string; port: number };
 }
 
