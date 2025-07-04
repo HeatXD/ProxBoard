@@ -1,16 +1,12 @@
 {
   "name": "proxboard",
   "module": "index.ts",
-  "type": "module",
-  "private": true,
   "devDependencies": {
-    "@types/bun": "latest",
-    "@types/ws": "^8.18.1"
+    "@types/bun": "^1.2.18"
   },
   "peerDependencies": {
     "typescript": "^5"
   },
-  "dependencies": {
-    "ws": "^8.18.3"
-  }
+  "private": true,
+  "type": "module"
 }

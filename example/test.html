@@ -58,6 +58,10 @@
 
       ws.onopen = () => {
         log('WebSocket connected!');
+        sendMessage({
+          action: 'auth',
+          token: 'secret',
+        });
       };
 
       ws.onmessage = (event) => {

@@ -14,41 +14,58 @@
  * - Payload: The actual UDP packet data to forward
  */
 
-import * as dgram from 'dgram';
-import { WebSocketServer, WebSocket } from 'ws';
+import type { Server, ServerWebSocket } from "bun";
 
 interface ActiveProxy {
-    proxySocket: dgram.Socket;
+    proxySocket: any; // Bun's UDPSocket type
     proxyHost: { address: string; port: number };
 }
 
-export function encodeProxyMessage(targetHost: string, targetPort: number, payload: Buffer): Buffer {
-    const hostnameBuffer = Buffer.from(targetHost, 'utf8');
+interface WebSocketData {
+    authenticated: boolean;
+    authTimeout?: NodeJS.Timeout;
+}
+
+export function encodeProxyMessage(targetHost: string, targetPort: number, payload: ArrayBuffer): ArrayBuffer {
+    const hostnameBuffer = new TextEncoder().encode(targetHost);
     const hostnameLength = hostnameBuffer.length;
 
     if (hostnameLength > 255) throw new Error('Hostname is too long (max 255 bytes).');
     if (targetPort < 1 || targetPort > 65535) throw new Error('Target port must be between 1 and 65535.');
 
-    const totalLength = 1 + hostnameLength + 2 + payload.length;
-    const buffer = Buffer.alloc(totalLength);
+    const totalLength = 1 + hostnameLength + 2 + payload.byteLength;
+    const buffer = new ArrayBuffer(totalLength);
+    const view = new DataView(buffer);
+    const uint8View = new Uint8Array(buffer);
 
-    buffer.writeUInt8(hostnameLength, 0);
-    hostnameBuffer.copy(buffer, 1);
-    buffer.writeUInt16BE(targetPort, 1 + hostnameLength);
-    payload.copy(buffer, 1 + hostnameLength + 2);
+    // Write hostname length
+    view.setUint8(0, hostnameLength);
+    
+    // Write hostname
+    uint8View.set(hostnameBuffer, 1);
+    
+    // Write target port (big-endian)
+    view.setUint16(1 + hostnameLength, targetPort, false);
+    
+    // Write payload
+    uint8View.set(new Uint8Array(payload), 1 + hostnameLength + 2);
 
     return buffer;
 }
 
-export function decodeProxyMessage(messageBuffer: Buffer): { targetHost: string; targetPort: number; payload: Buffer } {
-    if (messageBuffer.length < 4) throw new Error('Malformed message: too short.');
+export function decodeProxyMessage(messageBuffer: ArrayBuffer): { targetHost: string; targetPort: number; payload: ArrayBuffer } {
+    if (messageBuffer.byteLength < 4) throw new Error('Malformed message: too short.');
 
-    const hostnameLength = messageBuffer.readUInt8(0);
-    if (messageBuffer.length < 1 + hostnameLength + 2) throw new Error('Malformed message: incomplete header.');
+    const view = new DataView(messageBuffer);
+    const uint8View = new Uint8Array(messageBuffer);
+    
+    const hostnameLength = view.getUint8(0);
+    if (messageBuffer.byteLength < 1 + hostnameLength + 2) throw new Error('Malformed message: incomplete header.');
 
-    const targetHost = messageBuffer.toString('utf8', 1, 1 + hostnameLength);
-    const targetPort = messageBuffer.readUInt16BE(1 + hostnameLength);
-    const payload = Buffer.from(messageBuffer.slice(1 + hostnameLength + 2));
+    const hostnameBytes = uint8View.slice(1, 1 + hostnameLength);
+    const targetHost = new TextDecoder().decode(hostnameBytes);
+    const targetPort = view.getUint16(1 + hostnameLength, false); // big-endian
+    const payload = messageBuffer.slice(1 + hostnameLength + 2);
 
     if (!targetHost || isNaN(targetPort) || targetPort < 1 || targetPort > 65535) {
         throw new Error(`Malformed message: Invalid host or port.`);
@@ -63,7 +80,7 @@ export class ProxBoardService {
     private readonly maxProxyPort: number;
     private readonly accessToken: string;
     private activeProxies: Map<number, ActiveProxy>;
-    private wss: WebSocketServer;
+    private server: Server;
 
     constructor(wsApiPort: number, minProxyPort: number, maxProxyPort: number, token: string) {
         this.wsApiPort = wsApiPort;
@@ -72,53 +89,121 @@ export class ProxBoardService {
         this.accessToken = token;
         
         this.activeProxies = new Map<number, ActiveProxy>();
-        this.wss = new WebSocketServer({ port: this.wsApiPort });
+        
+        this.server = Bun.serve({
+            port: this.wsApiPort,
+            fetch: this.handleHttpRequest.bind(this),
+            websocket: {
+                open: this.handleWebSocketOpen.bind(this),
+                message: this.handleWebSocketMessage.bind(this),
+                close: this.handleWebSocketClose.bind(this)
+            }
+        });
 
         console.log(`ProxBoard Backend Service started.`);
         console.log(`WebSocket API: ws://localhost:${this.wsApiPort}`);
         console.log(`Available UDP proxy port range: ${this.minProxyPort}-${this.maxProxyPort}`);
-
-        this.setupWebSocketListeners();
+        
+        this.printApiCommands();
     }
 
-    private setupWebSocketListeners(): void {
-        this.wss.on('connection', ws => {
-            console.log('WebSocket client connected.');
-
-            let authenticated = false;
-
-            // Start a 5 second timer to receive a valid token
-            const authTimeout = setTimeout(() => {
-                if (!authenticated) {
-                    console.log('Authentication timeout: closing connection.');
-                    ws.close(4001, 'Authentication required');
-                }
-            }, 5000);
-
-            // Override message handler for first message (token auth)
-            ws.once('message', msg => {
-                try {
-                    const data = JSON.parse(msg.toString());
-                    if (data.action === 'auth' && data.token === this.accessToken) {
-                        authenticated = true;
-                        clearTimeout(authTimeout);
-                        ws.send(JSON.stringify({ status: 'success', message: 'Authenticated' }));
-                        // Now listen for other messages normally
-                        ws.on('message', msg => this.handleWebSocketMessage(ws, msg));
-                    } else {
-                        ws.send(JSON.stringify({ status: 'error', message: 'Invalid token' }));
-                        ws.close(4003, 'Invalid token');
-                    }
-                } catch (err) {
-                    ws.send(JSON.stringify({ status: 'error', message: 'Malformed auth message' }));
-                    ws.close(4002, 'Malformed auth message');
-                }
+    private handleHttpRequest(req: Request): Response | undefined {
+        const url = new URL(req.url);
+        
+        if (req.headers.get('upgrade') === 'websocket') {
+            const success = this.server.upgrade(req, {
+                data: { authenticated: false } as WebSocketData
             });
+            if (success) {
+                return undefined; // upgrade successful
+            }
+        }
+        
+        return new Response('ProxBoard WebSocket API', { status: 200 });
+    }
 
-            ws.on('close', () => console.log('WebSocket client disconnected.'));
-            ws.on('error', err => console.error('WebSocket error:', err));
-        });
+    private handleWebSocketOpen(ws: ServerWebSocket<WebSocketData>): void {
+        console.log('WebSocket client connected.');
+        
+        // Initialize data
+        ws.data = {
+            authenticated: false
+        };
+        
+        // Start a 5 second timer to receive a valid token
+        const authTimeout = setTimeout(() => {
+            if (!ws.data.authenticated) {
+                console.log('Authentication timeout: closing connection.');
+                ws.close(4001, 'Authentication required');
+            }
+        }, 5000);
+        
+        ws.data.authTimeout = authTimeout;
+    }
 
+    private handleWebSocketMessage(ws: ServerWebSocket<WebSocketData>, message: string | Buffer): void {
+        try {
+            const data = JSON.parse(message.toString());
+            
+            // Handle authentication
+            if (!ws.data.authenticated) {
+                if (data.action === 'auth' && data.token === this.accessToken) {
+                    ws.data.authenticated = true;
+                    if (ws.data.authTimeout) {
+                        clearTimeout(ws.data.authTimeout);
+                    }
+                    ws.send(JSON.stringify({ status: 'success', message: 'Authenticated' }));
+                } else {
+                    ws.send(JSON.stringify({ status: 'error', message: 'Invalid token' }));
+                    ws.close(4003, 'Invalid token');
+                }
+                return;
+            }
+            
+            // Handle authenticated messages
+            this.handleAuthenticatedMessage(ws, data);
+            
+        } catch (error: any) {
+            console.error('WebSocket message error:', error);
+            if (!ws.data.authenticated) {
+                ws.send(JSON.stringify({ status: 'error', message: 'Malformed auth message' }));
+                ws.close(4002, 'Malformed auth message');
+            } else {
+                ws.send(JSON.stringify({ status: 'error', message: error.message }));
+            }
+        }
+    }
+
+    private async handleAuthenticatedMessage(ws: ServerWebSocket<WebSocketData>, data: any): Promise<void> {
+        const action = data.action;
+        let response: any;
+
+        switch (action) {
+            case 'list':
+                response = this.listProxies();
+                break;
+            case 'create':
+                const { proxyHostAddress, proxyHostPort } = data;
+                response = await this.createProxy(proxyHostAddress, proxyHostPort);
+                break;
+            case 'stop':
+                response = this.stopProxy(data.proxyPort);
+                break;
+            default:
+                response = { status: 'error', message: 'Unknown action.' };
+        }
+
+        ws.send(JSON.stringify(response));
+    }
+
+    private handleWebSocketClose(ws: ServerWebSocket<WebSocketData>): void {
+        console.log('WebSocket client disconnected.');
+        if (ws.data.authTimeout) {
+            clearTimeout(ws.data.authTimeout);
+        }
+    }
+
+    private printApiCommands(): void {
         console.log(`API Commands:`);
         console.log(`  { "action": "auth", "token": ... }`);
         console.log(`  { "action": "list" }`);
@@ -126,52 +211,22 @@ export class ProxBoardService {
         console.log(`  { "action": "stop", "proxyPort": ... }`);
     }
 
-    private async handleWebSocketMessage(ws: WebSocket, message: import('ws').RawData): Promise<void> {
-        try {
-            const data = JSON.parse(message.toString());
-            const action = data.action;
-            let response: any;
-
-            switch (action) {
-                case 'list':
-                    response = this.listProxies();
-                    break;
-                case 'create':
-                    const { proxyHostAddress, proxyHostPort } = data;
-                    response = await this.createProxy(proxyHostAddress, proxyHostPort);
-                    break;
-                case 'stop':
-                    response = this.stopProxy(data.proxyPort);
-                    break;
-                default:
-                    response = { status: 'error', message: 'Unknown action.' };
-            }
-
-            ws.send(JSON.stringify(response));
-        } catch (error: any) {
-            console.error('WebSocket message error:', error);
-            ws.send(JSON.stringify({ status: 'error', message: error.message }));
-        }
-    }
-
     private async findAvailablePort(): Promise<number | null> {
         for (let port = this.minProxyPort; port <= this.maxProxyPort; port++) {
             if (this.activeProxies.has(port)) continue;
 
-            const tempSocket = dgram.createSocket('udp4');
             try {
-                await new Promise<void>((resolve, reject) => {
-                    tempSocket.once('error', err => {
-                        tempSocket.close();
-                        if ((err as any).code === 'EADDRINUSE') resolve();
-                        else reject(err);
-                    });
-                    tempSocket.once('listening', () => {
-                        tempSocket.close();
-                        resolve();
-                    });
-                    tempSocket.bind(port, '0.0.0.0');
+                // Try to create a UDP socket on this port
+                const testSocket = await Bun.udpSocket({
+                    port,
+                    hostname: '0.0.0.0',
+                    socket: {
+                        data: () => {},
+                        error: () => {}
+                    }
                 });
+                
+                testSocket.close();
                 return port;
             } catch {
                 continue;
@@ -191,52 +246,44 @@ export class ProxBoardService {
         }
 
         try {
-            const proxySocket = dgram.createSocket('udp4');
             const proxyHost = { address: proxyHostAddress, port: proxyHostPort };
 
-            proxySocket.on('message', (msg, rinfo) => {
-                const isFromProxyHost = rinfo.address === proxyHost.address && rinfo.port === proxyHost.port;
+            const proxySocket = await Bun.udpSocket({
+                port: availablePort,
+                hostname: '0.0.0.0',
+                socket: {
+                    data: (socket, buf, port, address) => {
+                        const arrayBuffer = new Uint8Array(buf).buffer;
+                        const isFromProxyHost = address === proxyHost.address && port === proxyHost.port;
 
-                if (isFromProxyHost) {
-                    // Message from proxyHost: decode and forward to target
-                    let targetHost: string, targetPort: number, payload: Buffer;
-                    try {
-                        ({ targetHost, targetPort, payload } = decodeProxyMessage(msg));
-                    } catch (err: any) {
-                        console.warn(`Proxy ${availablePort}: Invalid message from proxyHost: ${err.message}`);
-                        return;
+                        if (isFromProxyHost) {
+                            // Message from proxyHost: decode and forward to target
+                            let targetHost: string, targetPort: number, payload: ArrayBuffer;
+                            try {
+                                ({ targetHost, targetPort, payload } = decodeProxyMessage(arrayBuffer));
+                            } catch (err: any) {
+                                console.warn(`Proxy ${availablePort}: Invalid message from proxyHost: ${err.message}`);
+                                return;
+                            }
+
+                            socket.send(payload, targetPort, targetHost);
+
+                        } else {
+                            // Message from target host: encode and send back to proxyHost
+                            const encodedMsg = encodeProxyMessage(address, port, arrayBuffer);
+                            socket.send(encodedMsg, proxyHost.port, proxyHost.address);
+                        }
+                    },
+                    error: (socket, error) => {
+                        console.error(`Proxy ${availablePort} error:`, error);
+                        socket.close();
+                        this.activeProxies.delete(availablePort);
                     }
-
-                    proxySocket.send(payload, targetPort, targetHost, err => {
-                        if (err) {
-                            console.error(`Proxy ${availablePort}: Failed to send to ${targetHost}:${targetPort}:`, err);
-                        }
-                    });
-
-                } else {
-                    // Message from target host: encode and send back to proxyHost
-                    const encodedMsg = encodeProxyMessage(rinfo.address, rinfo.port, msg);
-                    proxySocket.send(encodedMsg, proxyHost.port, proxyHost.address, err => {
-                        if (err) {
-                            console.error(`Proxy ${availablePort}: Failed to send response back to proxyHost:`, err);
-                        }
-                    });
                 }
             });
 
-            proxySocket.on('error', err => {
-                console.error(`Proxy ${availablePort} error:`, err);
-                proxySocket.close();
-                this.activeProxies.delete(availablePort);
-            });
-
-            await new Promise<void>((resolve) => {
-                proxySocket.bind(availablePort, '0.0.0.0', () => {
-                    console.log(`Proxy created on port ${availablePort} for proxyHost ${proxyHostAddress}:${proxyHostPort}`);
-                    this.activeProxies.set(availablePort, { proxySocket, proxyHost });
-                    resolve();
-                });
-            });
+            console.log(`Proxy created on port ${availablePort} for proxyHost ${proxyHostAddress}:${proxyHostPort}`);
+            this.activeProxies.set(availablePort, { proxySocket, proxyHost });
 
             return {
                 status: 'success',
@@ -257,10 +304,9 @@ export class ProxBoardService {
             return { status: 'error', action: 'stop', message: 'Proxy not found.' };
         }
 
-        proxy.proxySocket.close(() => {
-            console.log(`Proxy ${proxyPort} stopped.`);
-            this.activeProxies.delete(proxyPort);
-        });
+        proxy.proxySocket.close();
+        this.activeProxies.delete(proxyPort);
+        console.log(`Proxy ${proxyPort} stopped.`);
 
         return { status: 'success', action: 'stop', message: `Proxy on port ${proxyPort} stopped.` };
     }
@@ -283,9 +329,9 @@ export class ProxBoardService {
             console.log(`Closed proxy on port ${port}`);
         }
 
-        // Close WebSocket server
-        this.wss.close(() => {
-            console.log('WebSocket server closed.');
-        });
+        // Stop the server
+        this.server.stop();
+        console.log('Server stopped.');
+        process.exit(0);
     }
 }
